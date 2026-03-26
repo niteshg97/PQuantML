@@ -28,7 +28,7 @@ The various pruning methods have different training steps, such as a pre-trainin
 
 
 ### Example
-Example notebook can be found [here](https://github.com/nroope/PQuant/tree/main/examples). It handles the
+Example notebook can be found [here](https://github.com/cern-nextgen/PQuantML/tree/main/examples). It handles the
   1. Creation of a torch model and data loaders.
   2. Creation of the training and validation functions.
   3. Loading a default pruning configuration of a pruning method.
