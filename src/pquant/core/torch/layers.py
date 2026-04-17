@@ -1108,7 +1108,7 @@ class PQBatchNorm1d(nn.BatchNorm1d):
             loss += self.input_quantizer.hgq_loss()
         return loss
 
-    def post_pretrain_function(self):
+    def post_pre_train_function(self):
         self.is_pretraining = False
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -1120,6 +1120,209 @@ class PQBatchNorm1d(nn.BatchNorm1d):
                 if self.post_fitcompress_calibration:
                     self.saved_inputs.append(input)
         return super().forward(input)
+
+
+def linear_approximation_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    return F.softmax(x, dim=dim)
+
+
+class PQMultiheadAttention(nn.Module):
+    """Multi-head attention with quantization support, implemented without F.multihead_attention.
+
+    Uses separate PQDense projections for Q, K, V, and output, and computes
+    scaled dot-product attention manually.
+
+    Args:
+        config: PQuant configuration object.
+        embed_dim: Total embedding dimension.
+        num_heads: Number of attention heads.
+        dropout: Dropout probability on attention weights.
+        bias: Whether to add bias to projection layers.
+        kdim: Key feature dimension (defaults to embed_dim).
+        vdim: Value feature dimension (defaults to embed_dim).
+        batch_first: If True, input/output tensors are (batch, seq, feature).
+            If False (default), tensors are (seq, batch, feature).
+        quantize_input: Whether to quantize Q/K/V projection inputs.
+        quantize_output: Whether to quantize projection outputs.
+        quantize_attn_weights: Whether to quantize attention weights after softmax.
+        in_quant_bits: (k, i, f) bits for input quantization.
+        weight_quant_bits: (k, i, f) bits for weight quantization.
+        bias_quant_bits: (k, i, f) bits for bias quantization.
+        out_quant_bits: (k, i, f) bits for output quantization.
+        attn_quant_bits: (k, i, f) bits for attention weight quantization.
+    """
+
+    def __init__(
+        self,
+        config,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        kdim: int = None,
+        vdim: int = None,
+        batch_first: bool = False,
+        quantize_input: bool = True,
+        quantize_output: bool = False,
+        quantize_attn_weights: bool = False,
+        quantize_attn_scores: bool = False,
+        quantize_context: bool = False,
+        approximate_softmax: bool = False,
+        in_quant_bits: Tuple[T, T, T] = None,
+        weight_quant_bits: Tuple[T, T, T] = None,
+        bias_quant_bits: Tuple[T, T, T] = None,
+        out_quant_bits: Tuple[T, T, T] = None,
+        attn_quant_bits: Tuple[T, T, T] = None,
+        attn_score_quant_bits: Tuple[T, T, T] = None,
+        context_quant_bits: Tuple[T, T, T] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.batch_first = batch_first
+        self.dropout = dropout
+        self.quantize_attn_weights = quantize_attn_weights
+        self.quantize_attn_scores = quantize_attn_scores
+        self.quantize_context = quantize_context
+        self.approximate_softmax = approximate_softmax
+        self.scale = self.head_dim**-0.5
+
+        kdim = kdim if kdim is not None else embed_dim
+        vdim = vdim if vdim is not None else embed_dim
+
+        proj_kwargs = dict(
+            bias=bias,
+            quantize_input=quantize_input,
+            quantize_output=quantize_output,
+            in_quant_bits=in_quant_bits,
+            weight_quant_bits=weight_quant_bits,
+            bias_quant_bits=bias_quant_bits,
+            out_quant_bits=out_quant_bits,
+        )
+        self.q_proj = PQDense(config, embed_dim, embed_dim, enable_pruning=False, **proj_kwargs)
+        self.k_proj = PQDense(config, kdim, embed_dim, enable_pruning=False, **proj_kwargs)
+        self.v_proj = PQDense(config, vdim, embed_dim, enable_pruning=False, **proj_kwargs)
+        self.out_proj = PQDense(config, embed_dim, embed_dim, **proj_kwargs)
+
+        self.attn_dropout = None
+
+        def _make_data_quantizer(bits):
+            if bits is not None:
+                k, i, f = bits
+            else:
+                k = config.quantization_parameters.default_data_keep_negatives
+                i = config.quantization_parameters.default_data_integer_bits
+                f = config.quantization_parameters.default_data_fractional_bits
+            return Quantizer(
+                k=torch.tensor(k),
+                i=torch.tensor(i),
+                f=torch.tensor(f),
+                overflow=config.quantization_parameters.overflow_mode_data,
+                round_mode=config.quantization_parameters.round_mode,
+                is_heterogeneous=config.quantization_parameters.use_high_granularity_quantization,
+                is_data=True,
+                hgq_gamma=config.quantization_parameters.hgq_gamma,
+                place="datalane",
+            )
+
+        if quantize_attn_weights:
+            self.attn_weight_quantizer = _make_data_quantizer(attn_quant_bits)
+        if quantize_attn_scores:
+            self.attn_score_quantizer = _make_data_quantizer(attn_score_quant_bits)
+        if quantize_context:
+            self.context_quantizer = _make_data_quantizer(context_quant_bits)
+        self.enable_quantization = config.quantization_parameters.enable_quantization
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.batch_first:
+            # (B, T, E) -> keep as-is
+            B, T, _ = query.shape
+            S = key.shape[1]
+        else:
+            # (T, B, E) -> (B, T, E)
+            query = query.transpose(0, 1)
+            key = key.transpose(0, 1)
+            value = value.transpose(0, 1)
+            B, T, _ = query.shape
+            S = key.shape[1]
+
+        q = self.q_proj(query)  # (B, T, E)
+        k = self.k_proj(key)  # (B, S, E)
+        v = self.v_proj(value)  # (B, S, E)
+
+        # Reshape to (B, H, T/S, head_dim)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention scores: (B, H, T, S)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                # (T, S) -> (1, 1, T, S), broadcast over batch and heads
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+            elif attn_mask.dim() == 3:
+                # (B*H, T, S) -> (B, H, T, S)
+                attn_mask = attn_mask.view(B, self.num_heads, T, S)
+            attn_scores = attn_scores + attn_mask
+
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, S), True means ignore
+            attn_scores = attn_scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf"))
+
+        if self.quantize_attn_scores and self.enable_quantization:
+            attn_scores = self.attn_score_quantizer(attn_scores)
+
+        if self.approximate_softmax:
+            attn_weights = linear_approximation_softmax(attn_scores, dim=-1)
+        else:
+            attn_weights = F.softmax(attn_scores, dim=-1)
+
+        if self.quantize_attn_weights and self.enable_quantization:
+            attn_weights = self.attn_weight_quantizer(attn_weights)
+
+        if self.attn_dropout is not None and self.training:
+            attn_weights = self.attn_dropout(attn_weights)
+
+        # Weighted sum of values: (B, H, T, head_dim)
+        out = torch.matmul(attn_weights, v)
+
+        if self.quantize_context and self.enable_quantization:
+            out = self.context_quantizer(out)
+
+        # Merge heads: (B, T, E)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.embed_dim)
+        out = self.out_proj(out)
+
+        if not self.batch_first:
+            out = out.transpose(0, 1)
+
+        if need_weights:
+            # Average attention weights over heads: (B, T, S)
+            return out, attn_weights.mean(dim=1)
+        return out, None
+
+    def extra_repr(self) -> str:
+        return (
+            f"embed_dim={self.embed_dim}, num_heads={self.num_heads}, "
+            f"dropout={self.dropout}, batch_first={self.batch_first}, "
+            f"quantize_attn_scores={self.quantize_attn_scores}, "
+            f"quantize_attn_weights={self.quantize_attn_weights}, "
+            f"quantize_context={self.quantize_context}"
+        )
 
 
 def add_layer_specific_quantization_to_model(name, layer, config):
