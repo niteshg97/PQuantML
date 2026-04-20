@@ -22,7 +22,12 @@ def hard_tanh(x):
     return 2.0 * hard_sigmoid(x) - 1.0
 
 
-activation_registry = {"relu": relu, "tanh": tanh, "hard_tanh": hard_tanh}
+activation_registry = {
+    "relu": relu,
+    "tanh": tanh,
+    "hard_tanh": hard_tanh,
+    "leaky_relu": nn.LeakyReLU(negative_slope=0.1015625),
+}
 
 
 class PQActivation(nn.Module):
