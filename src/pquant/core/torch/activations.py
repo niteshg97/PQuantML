@@ -27,6 +27,7 @@ activation_registry = {
     "tanh": tanh,
     "hard_tanh": hard_tanh,
     "leaky_relu": nn.LeakyReLU(negative_slope=0.1015625),
+    "gelu": nn.GELU(),
 }
 
 
