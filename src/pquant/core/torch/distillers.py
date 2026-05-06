@@ -9,36 +9,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
 
-os.environ.setdefault("KERAS_BACKEND", "torch")
-
-from pquant.core.torch.layers import (  # noqa: E402
+from pquant.core.torch.layers import (
     PQWeightBiasBase,
     get_model_losses,
     post_epoch_functions,
     post_pretrain_functions,
+    post_round_functions,
     pre_epoch_functions,
     pre_finetune_functions,
 )
 
 
-def _get_module(model: nn.Module, name: str) -> nn.Module:
+def get_module(model: nn.Module, name: str) -> nn.Module:
     for n, m in model.named_modules():
         if n == name:
             return m
     raise ValueError(f"Module '{name}' not found in model")
 
 
-def _pq_layer_names(model: nn.Module) -> list[str]:
+def pq_layer_names(model: nn.Module) -> list[str]:
     """Return names of all PQWeightBiasBase submodules in forward order."""
     return [name for name, m in model.named_modules() if isinstance(m, PQWeightBiasBase)]
 
 
-class _DiskCachedDataset(torch.utils.data.Dataset):
+class CachedDataset(torch.utils.data.Dataset):
     """Per-batch cache backed by files in a temporary directory.
 
-    Each file stores one ``(layer_input, layer_output)`` batch as a tuple.
-    The DataLoader using this dataset should set ``collate_fn=lambda b: b[0]``
-    and ``batch_size=1`` so batches are returned as-is without re-collation.
+    Each file stores one ``(input, output)`` batch as a tuple.
+    Since each file has one batch, uses batch_size of 1 here.
     """
 
     def __init__(self, cache_dir: str, n_batches: int) -> None:
@@ -60,38 +58,30 @@ class LayerwiseDistiller:
     Distills a teacher model into a student model one PQ layer at a time.
 
     For each layer, all student parameters are frozen except that layer's,
-    and the layer is trained to match the teacher's activations at that point
-    via a hook-captured MSE loss.
+    and the layer is trained to match the teacher's outputs at that point.
 
     Args:
-        teacher: Full-precision reference model. Will be set to eval() and
+        teacher: Reference model. Will be set to eval() and
                  gradients disabled during distillation.
-        student: PQ model with the same architecture.
-        loss_fn: Loss between student and teacher activations. Defaults to MSE.
+        student: PQuantML model.
+        loss_fn: Loss function between student and teacher activations.
         precompute_layer_inputs: If True, run one pass over the dataloader at
-                       the start of ``distill_layer``, capturing the student
-                       layer's input (pre-hook on the frozen student) and the
-                       teacher layer's output (post-hook on the teacher). Pairs
-                       are saved to a temporary directory on disk (one ``.pt``
-                       file per batch) so RAM usage is bounded. All epoch loops
-                       then call ``student_layer(layer_input)`` directly,
-                       skipping the full model forward entirely. Requires disk
-                       space proportional to the dataset size times the feature
-                       map size at the target layer.
+                       the start of ``distill_layer``, capturing the teacher
+                       layer's input and output. Pairs
+                       are saved to a temporary directory on disk. All epoch loops
+                       then call ``student_layer(layer_input)`` directly, skipping the full model forward entirely.
         prefetch_workers: Number of DataLoader worker processes used to
                        prefetch cached batches from disk when
-                       ``precompute_layer_inputs=True``. Defaults to 2.
+                       ``precompute_layer_inputs=True``.
         cache_dir:     Directory under which temporary per-layer cache
-                       subdirectories are created when
-                       ``precompute_layer_inputs=True``. Defaults to the
-                       current working directory. Avoid ``/tmp`` on Linux as
-                       it is typically a RAM-backed ``tmpfs``.
+                       subdirectories are created when ``precompute_layer_inputs=True``.
     """
 
     def __init__(
         self,
         teacher: nn.Module,
         student: nn.Module,
+        device: torch.device | None,
         loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         precompute_layer_inputs: bool = True,
         prefetch_workers: int = 2,
@@ -99,60 +89,56 @@ class LayerwiseDistiller:
     ):
         self.teacher = teacher
         self.student = student
+        self.device = device
         self.loss_fn = loss_fn or F.mse_loss
         self.precompute_layer_inputs = precompute_layer_inputs
         self.prefetch_workers = prefetch_workers
         self.cache_dir = cache_dir
 
         self.teacher.eval()
-        for p in self.teacher.parameters():
-            p.requires_grad_(False)
+        for param in self.teacher.parameters():
+            param.requires_grad_(False)
 
-    def _precompute_layer_io(
+    def precompute_layer_io(
         self,
         teacher_layer: nn.Module,
-        student_layer: nn.Module,
         dataloader: Iterable,
-        device: torch.device | None,
         cache_dir: str,
     ) -> torch.utils.data.DataLoader:
-        """Cache ``(student_layer_input, teacher_layer_output)`` to disk.
+        """Cache ``(layer_input, layer_output)``.
 
         Runs one teacher pass and one frozen student pass per batch, saving
-        each pair to ``cache_dir/{index:08d}.pt``. Returns a DataLoader backed
-        by ``_DiskCachedDataset`` with ``prefetch_workers`` background workers.
+        each pair. Returns a DataLoader which uses this saved data.
         """
-        t_captured: dict[str, torch.Tensor] = {}
-        s_captured: dict[str, torch.Tensor] = {}
+        teacher_captured_data: dict[str, torch.Tensor] = {}
 
-        def _teacher_post(m: nn.Module, inp: tuple, out: torch.Tensor) -> None:
-            t = out[0] if isinstance(out, tuple) else out
-            t_captured['out'] = t.detach().cpu()
+        def teacher_post(m: nn.Module, inp: tuple, out: torch.Tensor) -> None:
+            teacher_output = out[0] if isinstance(out, tuple) else out
+            teacher_captured_data['out'] = teacher_output.detach().cpu()
 
-        def _student_pre(m: nn.Module, inp: tuple) -> None:
-            s_captured['inp'] = inp[0].detach().cpu()
+        def teacher_pre(m: nn.Module, inp: tuple) -> None:
+            teacher_captured_data['inp'] = inp[0].detach().cpu()
 
-        h_t_post = teacher_layer.register_forward_hook(_teacher_post)
-        h_s_pre = student_layer.register_forward_pre_hook(_student_pre)
+        teacher_output_hook = teacher_layer.register_forward_hook(teacher_post)
+        teacher_input_hook = teacher_layer.register_forward_pre_hook(teacher_pre)
 
         n_batches = 0
         try:
             with torch.no_grad():
                 for x, *_ in dataloader:
-                    if device is not None:
-                        x = x.to(device)
+                    if self.device is not None:
+                        x = x.to(self.device)
                     self.teacher(x)
-                    self.student(x)
                     torch.save(
-                        (s_captured['inp'], t_captured['out']),
+                        (teacher_captured_data['inp'], teacher_captured_data['out']),
                         os.path.join(cache_dir, f"{n_batches:08d}.pt"),
                     )
                     n_batches += 1
         finally:
-            h_t_post.remove()
-            h_s_pre.remove()
+            teacher_output_hook.remove()
+            teacher_input_hook.remove()
 
-        dataset = _DiskCachedDataset(cache_dir, n_batches)
+        dataset = CachedDataset(cache_dir, n_batches)
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=1,
@@ -161,12 +147,11 @@ class LayerwiseDistiller:
             collate_fn=lambda b: b[0],
         )
 
-    def _val_layer_loss(
+    def val_layer_loss(
         self,
         teacher_layer: nn.Module,
         student_layer: nn.Module,
         val_dataloader: Iterable,
-        device: torch.device | None,
     ) -> float:
         """Compute mean validation loss for a single layer (no grad, eval mode).
 
@@ -176,22 +161,22 @@ class LayerwiseDistiller:
         t_captured: dict[str, torch.Tensor] = {}
         s_captured: dict[str, torch.Tensor] = {}
 
-        def _teacher_post(m: nn.Module, inp: tuple, out) -> None:
+        def teacher_post(m: nn.Module, inp: tuple, out) -> None:
             t_captured['out'] = (out[0] if isinstance(out, tuple) else out).detach()
 
-        def _student_hook(m: nn.Module, inp: tuple, out) -> None:
+        def student_hook(m: nn.Module, inp: tuple, out) -> None:
             s_captured['out'] = out[0] if isinstance(out, tuple) else out
 
-        h_t = teacher_layer.register_forward_hook(_teacher_post)
-        h_s = student_layer.register_forward_hook(_student_hook)
+        h_t = teacher_layer.register_forward_hook(teacher_post)
+        h_s = student_layer.register_forward_hook(student_hook)
 
         self.student.eval()
         batch_losses: list[float] = []
         try:
             with torch.no_grad():
                 for x, *_ in val_dataloader:
-                    if device is not None:
-                        x = x.to(device)
+                    if self.device is not None:
+                        x = x.to(self.device)
                     self.teacher(x)
                     self.student(x)
                     batch_losses.append(self.loss_fn(s_captured['out'], t_captured['out']).item())
@@ -209,7 +194,6 @@ class LayerwiseDistiller:
         dataloader: Iterable,
         optimizer_factory: Callable[[Iterable], torch.optim.Optimizer],
         n_epochs: int,
-        device: torch.device | None = None,
         val_dataloader: Iterable | None = None,
         epoch_callback: Callable[[int, float, float | None, str], None] | None = None,
     ) -> list[float]:
@@ -228,7 +212,6 @@ class LayerwiseDistiller:
             n_epochs:    Number of full passes through the dataloader.
                          ``post_epoch_functions`` is called on the layer after
                          each pass.
-            device:      Move inputs to this device before each forward pass.
             val_dataloader: Optional validation dataloader. When provided, a
                          no-grad eval pass is run after every training epoch and
                          the resulting mean loss is passed to ``epoch_callback``.
@@ -242,8 +225,8 @@ class LayerwiseDistiller:
         Returns:
             List of per-epoch mean training losses.
         """
-        teacher_layer = _get_module(self.teacher, teacher_layer_name)
-        student_layer = _get_module(self.student, student_layer_name)
+        teacher_layer = get_module(self.teacher, teacher_layer_name)
+        student_layer = get_module(self.student, student_layer_name)
 
         # Freeze everything except the target layer (skip non-float params
         # like bool pruning masks which cannot require gradients)
@@ -256,15 +239,15 @@ class LayerwiseDistiller:
 
         optimizer = optimizer_factory(student_layer.parameters())
 
-        _tmpdir = None
+        tmpdir = None
         hooks = []
         epoch_losses: list[float] = []
         self.student.train()
 
         try:
             if self.precompute_layer_inputs:
-                _tmpdir = tempfile.TemporaryDirectory(prefix="ldistil_", dir=self.cache_dir or os.getcwd())
-                dataloader = self._precompute_layer_io(teacher_layer, student_layer, dataloader, device, _tmpdir.name)
+                tmpdir = tempfile.TemporaryDirectory(prefix="ldistil_", dir=self.cache_dir or os.getcwd())
+                dataloader = self.precompute_layer_io(teacher_layer, dataloader, self.device, tmpdir.name)
             else:
                 teacher_out: dict[str, torch.Tensor] = {}
                 student_out: dict[str, torch.Tensor] = {}
@@ -273,12 +256,12 @@ class LayerwiseDistiller:
                     t = out[0] if isinstance(out, tuple) else out
                     teacher_out["out"] = t.detach()
 
-                def _student_hook(m: nn.Module, inp: tuple, out) -> None:
+                def student_hook(m: nn.Module, inp: tuple, out) -> None:
                     t = out[0] if isinstance(out, tuple) else out
                     student_out["out"] = t
 
                 h_t = teacher_layer.register_forward_hook(_teacher_hook)
-                h_s = student_layer.register_forward_hook(_student_hook)
+                h_s = student_layer.register_forward_hook(student_hook)
                 hooks = [h_t, h_s]
 
             for epoch in range(n_epochs):
@@ -288,8 +271,8 @@ class LayerwiseDistiller:
 
                 if self.precompute_layer_inputs:
                     for t_in, t_out in dataloader:
-                        if device is not None:
-                            t_in, t_out = t_in.to(device), t_out.to(device)
+                        if self.device is not None:
+                            t_in, t_out = t_in.to(self.device), t_out.to(self.device)
                         raw = student_layer(t_in)
                         s_out = raw[0] if isinstance(raw, tuple) else raw
                         loss = self.loss_fn(s_out, t_out)
@@ -299,8 +282,8 @@ class LayerwiseDistiller:
                         batch_losses.append(loss.item())
                 else:
                     for x, *_ in dataloader:
-                        if device is not None:
-                            x = x.to(device)
+                        if self.device is not None:
+                            x = x.to(self.device)
                         with torch.no_grad():
                             self.teacher(x)
                         self.student(x)
@@ -317,14 +300,14 @@ class LayerwiseDistiller:
                     student_layer.pruning_layer.post_epoch_function(epoch, n_epochs)
                 val_loss: float | None = None
                 if val_dataloader is not None:
-                    val_loss = self._val_layer_loss(teacher_layer, student_layer, val_dataloader, device)
+                    val_loss = self.val_layer_loss(teacher_layer, student_layer, val_dataloader)
                 if epoch_callback is not None:
                     epoch_callback(epoch, mean_loss, val_loss, student_layer_name)
         finally:
             for h in hooks:
                 h.remove()
-            if _tmpdir is not None:
-                _tmpdir.cleanup()
+            if tmpdir is not None:
+                tmpdir.cleanup()
             for name, param in self.student.named_parameters():
                 if name in frozen:
                     param.requires_grad_(frozen[name])
@@ -337,7 +320,6 @@ class LayerwiseDistiller:
         optimizer_factory: Callable[[Iterable], torch.optim.Optimizer],
         n_epochs: int,
         layer_names: list[tuple[str, str]] | None = None,
-        device: torch.device | None = None,
         val_dataloader: Iterable | None = None,
         epoch_callback: Callable[[int, float, float | None, str], None] | None = None,
         layer_callback: Callable[[str, str, list[float]], None] | None = None,
@@ -353,7 +335,6 @@ class LayerwiseDistiller:
             layer_names:       List of ``(teacher_layer_name, student_layer_name)``
                                tuples to distill. Defaults to pairing each
                                ``PQWeightBiasBase`` submodule name with itself.
-            device:            Move inputs to this device before each forward pass.
             val_dataloader:    Optional validation dataloader passed through to
                                each ``distill_layer`` call.
             epoch_callback:    Passed through to ``distill_layer``. Called after
@@ -371,7 +352,7 @@ class LayerwiseDistiller:
         if layer_names is not None:
             pairs = layer_names
         else:
-            names = _pq_layer_names(self.student)
+            names = pq_layer_names(self.student)
             pairs = [(n, n) for n in names]
         history: dict[tuple[str, str], list[float]] = {}
 
@@ -382,7 +363,6 @@ class LayerwiseDistiller:
                 dataloader,
                 optimizer_factory,
                 n_epochs,
-                device=device,
                 val_dataloader=val_dataloader,
                 epoch_callback=epoch_callback,
             )
@@ -443,13 +423,14 @@ class ModelDistiller:
                        as it is typically a RAM-backed ``tmpfs``.
     """
 
-    _LOSS_FN_OPTIONS = ("kl_ce", "kl", "mse")
+    LOSS_FN_OPTIONS = ("kl_ce", "kl", "mse")
 
     def __init__(
         self,
         teacher: nn.Module,
         student: nn.Module,
         pq_config,
+        device: torch.device | None,
         teacher_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
         loss_fn: str = "kl_ce",
         temperature: float = 4.0,
@@ -458,8 +439,8 @@ class ModelDistiller:
         prefetch_workers: int = 2,
         cache_dir: str | None = None,
     ):
-        if loss_fn not in self._LOSS_FN_OPTIONS:
-            raise ValueError(f"loss_fn must be one of {self._LOSS_FN_OPTIONS}, got '{loss_fn}'")
+        if loss_fn not in self.LOSS_FN_OPTIONS:
+            raise ValueError(f"loss_fn must be one of {self.LOSS_FN_OPTIONS}, got '{loss_fn}'")
 
         self.teacher = teacher
         self.student = student
@@ -471,38 +452,33 @@ class ModelDistiller:
         self.precompute_teacher_outputs = precompute_teacher_outputs
         self.prefetch_workers = prefetch_workers
         self.cache_dir = cache_dir
-
+        self.device = device
         self.teacher.eval()
         for p in self.teacher.parameters():
             p.requires_grad_(False)
 
-    def _precompute_teacher_outputs(
+    def precompute_teacher_outputs(
         self,
         dataloader: Iterable,
-        device: torch.device | None,
         cache_dir: str,
         shuffle: bool = True,
     ) -> torch.utils.data.DataLoader:
-        """Run one teacher inference pass and cache ``(x, y, teacher_merged)`` to disk.
-
-        Returns a DataLoader whose batches are ``(x, y, teacher_merged)``; the
-        third element is detected by ``_run_epoch`` to skip teacher inference.
-        """
+        """Run one teacher inference pass and cache ``(x, teacher_output)`` to disk."""
         n_batches = 0
         self.teacher.eval()
         with torch.no_grad():
-            for x, y, *_ in dataloader:
-                if device is not None:
-                    x = x.to(device)
+            for x, *_ in dataloader:
+                if self.device is not None:
+                    x = x.to(self.device)
                 teacher_logits = self.teacher(x)
                 teacher_out = self.teacher_transform(teacher_logits) if self.teacher_transform else teacher_logits
                 torch.save(
-                    (x.cpu(), y.cpu(), teacher_out.cpu()),
+                    (x.cpu(), teacher_out.cpu()),
                     os.path.join(cache_dir, f"{n_batches:08d}.pt"),
                 )
                 n_batches += 1
 
-        dataset = _DiskCachedDataset(cache_dir, n_batches)
+        dataset = CachedDataset(cache_dir, n_batches)
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=1,
@@ -511,7 +487,7 @@ class ModelDistiller:
             collate_fn=lambda b: b[0],
         )
 
-    def _kl_divergence(self, student_logits: torch.Tensor, teacher_merged: torch.Tensor) -> torch.Tensor:
+    def kl_divergence(self, student_logits: torch.Tensor, teacher_merged: torch.Tensor) -> torch.Tensor:
         _, C, _, _ = student_logits.shape
         flat_s = student_logits.permute(0, 2, 3, 1).reshape(-1, C)
         flat_t = teacher_merged.permute(0, 2, 3, 1).reshape(-1, C)
@@ -519,97 +495,87 @@ class ModelDistiller:
         p_t = F.softmax(flat_t / self.T, dim=1)
         return F.kl_div(log_p_s, p_t, reduction="batchmean") * (self.T**2)
 
-    def _loss_kl_ce(
+    def loss_kl_ce(
         self,
         student_logits: torch.Tensor,
-        teacher_merged: torch.Tensor,
+        teacher_logits: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
         """alpha * KL(student || teacher) + (1 - alpha) * CE(student, labels)."""
-        kl_loss = self._kl_divergence(student_logits, teacher_merged)
+        kl_loss = self.kl_divergence(student_logits, teacher_logits)
         ce_loss = F.cross_entropy(student_logits, labels, ignore_index=-1)
         return self.alpha * kl_loss + (1 - self.alpha) * ce_loss
 
-    def _loss_kl(
+    def loss_kl(
         self,
         student_logits: torch.Tensor,
-        teacher_merged: torch.Tensor,
-        labels: torch.Tensor,
+        teacher_logits: torch.Tensor,
     ) -> torch.Tensor:
         """KL divergence only, no hard label term."""
-        return self._kl_divergence(student_logits, teacher_merged)
+        return self.kl_divergence(student_logits, teacher_logits)
 
-    def _loss_mse(
+    def loss_mse(
         self,
         student_logits: torch.Tensor,
-        teacher_merged: torch.Tensor,
-        labels: torch.Tensor,
+        teacher_logits: torch.Tensor,
     ) -> torch.Tensor:
         """MSE directly on logits, no temperature scaling."""
-        return F.mse_loss(student_logits, teacher_merged)
+        return F.mse_loss(student_logits, teacher_logits)
 
-    def _compute_loss(
+    def compute_loss(
         self,
         student_logits: torch.Tensor,
-        teacher_merged: torch.Tensor,
+        teacher_logits: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
         if self.loss_fn == "kl_ce":
-            return self._loss_kl_ce(student_logits, teacher_merged, labels)
+            return self.loss_kl_ce(student_logits, teacher_logits, labels)
         elif self.loss_fn == "kl":
-            return self._loss_kl(student_logits, teacher_merged, labels)
+            return self.loss_kl(student_logits, teacher_logits)
         else:  # mse
-            return self._loss_mse(student_logits, teacher_merged, labels)
+            return self.loss_mse(student_logits, teacher_logits)
 
-    def _run_val_epoch(
+    def run_val_epoch(
         self,
         val_dataloader: Iterable,
-        device: torch.device | None,
     ) -> float:
         """Compute mean validation loss over one pass of val_dataloader (no grad, eval mode).
 
         Accepts both raw ``(x, y)`` batches and precomputed ``(x, y, teacher_merged)``
-        batches produced by ``_precompute_teacher_outputs``.
+        batches produced by ``precompute_teacher_outputs``.
         """
         self.student.eval()
         batch_losses: list[float] = []
         with torch.no_grad():
-            for x, y, *extra in val_dataloader:
-                if device is not None:
-                    x, y = x.to(device), y.to(device)
-                if extra:
-                    teacher_merged = extra[0].to(device) if device is not None else extra[0]
-                else:
-                    teacher_logits = self.teacher(x)
-                    teacher_merged = self.teacher_transform(teacher_logits) if self.teacher_transform else teacher_logits
+            for x, y in val_dataloader:
+                if self.device is not None:
+                    x, y = x.to(self.device), y.to(self.device)
+                teacher_logits = self.teacher(x)
+                teacher_logits = self.teacher_transform(teacher_logits) if self.teacher_transform else teacher_logits
                 student_logits = self.student(x)
-                loss = self._compute_loss(student_logits, teacher_merged, y)
+                loss = self.compute_loss(student_logits, teacher_logits, y)
                 batch_losses.append(loss.item())
         self.student.train()
         return sum(batch_losses) / len(batch_losses)
 
-    def _run_epoch(
+    def run_epoch(
         self,
         dataloader: Iterable,
         optimizer: torch.optim.Optimizer,
-        device: torch.device | None,
     ) -> float:
         self.student.train()
         batch_losses: list[float] = []
 
-        for x, y, *extra in dataloader:
-            if device is not None:
-                x, y = x.to(device), y.to(device)
+        for x, y in dataloader:
+            if self.device is not None:
+                x, y = x.to(self.device), y.to(self.device)
 
-            if extra:
-                teacher_merged = extra[0].to(device) if device is not None else extra[0]
-            else:
-                with torch.no_grad():
-                    teacher_logits = self.teacher(x)
-                    teacher_merged = self.teacher_transform(teacher_logits) if self.teacher_transform else teacher_logits
+            with torch.no_grad():
+                teacher_logits = self.teacher(x)
+                teacher_logits = self.teacher_transform(teacher_logits) if self.teacher_transform else teacher_logits
 
             student_logits = self.student(x)
-            loss = self._compute_loss(student_logits, teacher_merged, y)
+            loss = self.compute_loss(student_logits, teacher_logits, y)
             loss = get_model_losses(self.student, loss)
 
             optimizer.zero_grad()
@@ -623,20 +589,15 @@ class ModelDistiller:
         self,
         dataloader: Iterable,
         optimizer: torch.optim.Optimizer,
-        device: torch.device | None = None,
         val_dataloader: Iterable | None = None,
         epoch_callback: Callable[[int, float, float | None], None] | None = None,
     ) -> list[float]:
         """
-        Run full-model distillation following the pquant training schedule:
-        pretraining_epochs → (post_pretrain) → epochs × rounds → (pre_finetune)
-        → fine_tuning_epochs. PQ layer losses (pruning, HGQ) are added to the
-        distillation loss via get_model_losses.
+        Run model distillation following the PQuantML training pipeline.
 
         Args:
-            dataloader:       Iterable of ``(images, masks, ...)`` batches.
+            dataloader:       Dataloader provided by user.
             optimizer:        Optimizer for student parameters.
-            device:           Move inputs to this device before each forward pass.
             val_dataloader:   Optional validation dataloader. When provided, a
                               no-grad eval pass is run after every training epoch
                               and the resulting mean loss is passed to
@@ -644,74 +605,70 @@ class ModelDistiller:
             epoch_callback:   Called after each epoch with
                               ``(epoch, train_loss, val_loss)`` where
                               ``val_loss`` is ``None`` when no ``val_dataloader``
-                              is given. Use this to drive per-epoch side effects
-                              such as calling ``student.increment_alpha()``,
-                              stepping a scheduler, or logging metrics.
+                              is given.
 
         Returns:
             List of per-epoch mean training losses.
         """
-        tc = self.pq_config.training_parameters
+        training_parameters = self.pq_config.training_parameters
 
-        _tmpdir = None
-        _tmpdir_val = None
+        tmpdir = None
+        tmpdir_val = None
         epoch_losses: list[float] = []
         global_epoch = 0
 
         try:
             if self.precompute_teacher_outputs:
-                _tmpdir = tempfile.TemporaryDirectory(prefix="mdistil_", dir=self.cache_dir or os.getcwd())
-                dataloader = self._precompute_teacher_outputs(dataloader, device, _tmpdir.name)
+                tmpdir = tempfile.TemporaryDirectory(prefix="mdistil_", dir=self.cache_dir or os.getcwd())
+                dataloader = self.precompute_teacher_outputs(dataloader, tmpdir.name)
                 if val_dataloader is not None:
-                    _tmpdir_val = tempfile.TemporaryDirectory(prefix="mdistil_val_", dir=self.cache_dir or os.getcwd())
-                    val_dataloader = self._precompute_teacher_outputs(
-                        val_dataloader, device, _tmpdir_val.name, shuffle=False
-                    )
+                    tmpdir_val = tempfile.TemporaryDirectory(prefix="mdistil_val_", dir=self.cache_dir or os.getcwd())
+                    val_dataloader = self.precompute_teacher_outputs(val_dataloader, tmpdir_val.name, shuffle=False)
 
-            for e in range(tc.pretraining_epochs):
-                pre_epoch_functions(self.student, e, tc.pretraining_epochs)
-                mean_loss = self._run_epoch(dataloader, optimizer, device)
+            for e in range(training_parameters.pretraining_epochs):
+                pre_epoch_functions(self.student, e, training_parameters.pretraining_epochs)
+                mean_loss = self.run_epoch(dataloader, optimizer)
                 epoch_losses.append(mean_loss)
-                post_epoch_functions(self.student, e, tc.pretraining_epochs)
+                post_epoch_functions(self.student, e, training_parameters.pretraining_epochs)
                 val_loss: float | None = None
                 if val_dataloader is not None:
-                    val_loss = self._run_val_epoch(val_dataloader, device)
+                    val_loss = self.run_val_epoch(val_dataloader)
                 if epoch_callback is not None:
                     epoch_callback(global_epoch, mean_loss, val_loss)
                 global_epoch += 1
 
             post_pretrain_functions(self.student, self.pq_config, train_loader=dataloader)
 
-            for _ in range(tc.rounds):
-                for e in range(tc.epochs):
-                    pre_epoch_functions(self.student, e, tc.epochs)
-                    mean_loss = self._run_epoch(dataloader, optimizer, device)
+            for _ in range(training_parameters.rounds):
+                for e in range(training_parameters.epochs):
+                    pre_epoch_functions(self.student, e, training_parameters.epochs)
+                    mean_loss = self.run_epoch(dataloader, optimizer)
                     epoch_losses.append(mean_loss)
-                    post_epoch_functions(self.student, e, tc.epochs)
+                    post_epoch_functions(self.student, e, training_parameters.epochs)
                     val_loss = None
                     if val_dataloader is not None:
-                        val_loss = self._run_val_epoch(val_dataloader, device)
+                        val_loss = self.run_val_epoch(val_dataloader)
                     if epoch_callback is not None:
                         epoch_callback(global_epoch, mean_loss, val_loss)
                     global_epoch += 1
+                post_round_functions(self.student)
 
             pre_finetune_functions(self.student)
-            for e in range(tc.fine_tuning_epochs):
-                pre_epoch_functions(self.student, e, tc.fine_tuning_epochs)
-                mean_loss = self._run_epoch(dataloader, optimizer, device)
+            for e in range(training_parameters.fine_tuning_epochs):
+                pre_epoch_functions(self.student, e, training_parameters.fine_tuning_epochs)
+                mean_loss = self.run_epoch(dataloader, optimizer)
                 epoch_losses.append(mean_loss)
-                post_epoch_functions(self.student, e, tc.fine_tuning_epochs)
                 val_loss = None
                 if val_dataloader is not None:
-                    val_loss = self._run_val_epoch(val_dataloader, device)
+                    val_loss = self.run_val_epoch(val_dataloader)
                 if epoch_callback is not None:
                     epoch_callback(global_epoch, mean_loss, val_loss)
-                post_epoch_functions(self.student, e, tc.fine_tuning_epochs)
+                post_epoch_functions(self.student, e, training_parameters.fine_tuning_epochs)
                 global_epoch += 1
         finally:
-            if _tmpdir is not None:
-                _tmpdir.cleanup()
-            if _tmpdir_val is not None:
-                _tmpdir_val.cleanup()
+            if tmpdir is not None:
+                tmpdir.cleanup()
+            if tmpdir_val is not None:
+                tmpdir_val.cleanup()
 
         return epoch_losses
