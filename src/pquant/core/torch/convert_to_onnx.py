@@ -50,6 +50,7 @@ from pquant.core.torch.layers import (  # noqa: E402
     PQConv1d,
     PQConv2d,
     PQDense,
+    PQLayerNorm,
     PQMultiheadAttention,
 )
 
@@ -112,8 +113,15 @@ def _quant_node(name_prefix, input_name, rounding_mode, k, i, f, initializers, o
 # ---------------------------------------------------------------------------
 
 
-def _qdq_node(name_prefix, input_name, rounding_mode, k, i, f, initializers, overflow_mode="SAT"):  # noqa: ARG001
-    """Build Clip+QuantizeLinear+DequantizeLinear nodes. Returns ([nodes], output_name)."""
+def _qdq_node(
+    name_prefix, input_name, rounding_mode, k, i, f, initializers, overflow_mode="SAT", include_clip=True
+):  # noqa: ARG001
+    """Build QuantizeLinear+DequantizeLinear nodes, optionally preceded by a Clip.
+
+    Returns ([nodes], output_name). Set include_clip=False to skip the Clip node
+    (safe when values are guaranteed in-range at inference time, since
+    QuantizeLinear saturates naturally).
+    """
     k_val = int(k.item())
     i_val = float(i.item())
     f_val = float(f.item())
@@ -129,25 +137,33 @@ def _qdq_node(name_prefix, input_name, rounding_mode, k, i, f, initializers, ove
         clip_min = float(-(2.0**i_val))
     zp_val = np.int8(0) if signed else np.uint8(0)
 
-    clip_min_name = f"{name_prefix}_clip_min"
-    clip_max_name = f"{name_prefix}_clip_max"
     scale_name = f"{name_prefix}_scale"
     zp_name = f"{name_prefix}_zero_point"
-    clipped_name = f"{name_prefix}_clipped"
     quantized_name = f"{name_prefix}_quantized"
     out_name = f"{name_prefix}_dequantized"
 
     initializers += [
-        onh.from_array(np.array(clip_min, dtype=np.float32), name=clip_min_name),
-        onh.from_array(np.array(clip_max, dtype=np.float32), name=clip_max_name),
         onh.from_array(np.array(scale, dtype=np.float32), name=scale_name),
         onh.from_array(np.array(zp_val), name=zp_name),
     ]
-    nodes = [
-        oh.make_node("Clip", inputs=[input_name, clip_min_name, clip_max_name], outputs=[clipped_name]),
-        oh.make_node("QuantizeLinear", inputs=[clipped_name, scale_name, zp_name], outputs=[quantized_name]),
-        oh.make_node("DequantizeLinear", inputs=[quantized_name, scale_name, zp_name], outputs=[out_name]),
-    ]
+
+    if include_clip:
+        clip_min_name = f"{name_prefix}_clip_min"
+        clip_max_name = f"{name_prefix}_clip_max"
+        clipped_name = f"{name_prefix}_clipped"
+        initializers += [
+            onh.from_array(np.array(clip_min, dtype=np.float32), name=clip_min_name),
+            onh.from_array(np.array(clip_max, dtype=np.float32), name=clip_max_name),
+        ]
+        nodes = [
+            oh.make_node("Clip", inputs=[input_name, clip_min_name, clip_max_name], outputs=[clipped_name]),
+            oh.make_node("QuantizeLinear", inputs=[clipped_name, scale_name, zp_name], outputs=[quantized_name]),
+        ]
+    else:
+        nodes = [
+            oh.make_node("QuantizeLinear", inputs=[input_name, scale_name, zp_name], outputs=[quantized_name]),
+        ]
+    nodes.append(oh.make_node("DequantizeLinear", inputs=[quantized_name, scale_name, zp_name], outputs=[out_name]))
     return nodes, out_name
 
 
@@ -679,6 +695,86 @@ def _add_batchnorm(module, prefix, current, nodes, initializers, quant_fn, use_q
     return bn_out
 
 
+def _add_layernorm(module, prefix, current, nodes, initializers, quant_fn, use_qonnx, store_integer_weights):
+    """PQLayerNorm. Emits LayerNormalization (opset >= 17 required)."""
+    current = _maybe_quant_input(module, prefix, current, nodes, initializers, quant_fn)
+
+    ns = (
+        tuple(int(d) for d in module.normalized_shape)
+        if hasattr(module.normalized_shape, "__iter__")
+        else (int(module.normalized_shape),)
+    )
+    axis = -len(ns)
+
+    has_weight = module._weight is not None
+    has_bias = module._bias is not None
+
+    gamma_np = module._weight.detach().cpu().numpy().astype(np.float32) if has_weight else np.ones(ns, dtype=np.float32)
+    beta_np = module._bias.detach().cpu().numpy().astype(np.float32) if has_bias else None
+
+    if use_qonnx and has_weight:
+        gamma_fp_name = f"{prefix}_gamma_fp"
+        initializers.append(onh.from_array(gamma_np, name=gamma_fp_name))
+        k_w, i_w, f_w = module.weight_quantizer.get_quantization_bits()
+        g_nodes, q_gamma = _quant_node(
+            f"{prefix}_gamma",
+            gamma_fp_name,
+            module.weight_quantizer.round_mode,
+            k_w,
+            i_w,
+            f_w,
+            initializers,
+            overflow_mode=getattr(module.weight_quantizer, "overflow", "SAT"),
+        )
+        nodes.extend(g_nodes)
+        if has_bias:
+            beta_fp_name = f"{prefix}_beta_fp"
+            initializers.append(onh.from_array(beta_np, name=beta_fp_name))
+            k_b, i_b, f_b = module.bias_quantizer.get_quantization_bits()
+            b_nodes, q_beta = _quant_node(
+                f"{prefix}_beta",
+                beta_fp_name,
+                module.bias_quantizer.round_mode,
+                k_b,
+                i_b,
+                f_b,
+                initializers,
+                overflow_mode=getattr(module.bias_quantizer, "overflow", "SAT"),
+            )
+            nodes.extend(b_nodes)
+    elif store_integer_weights and has_weight:
+        k_w, i_w, f_w = module.weight_quantizer.get_quantization_bits()
+        g_nodes, q_gamma = _int_weight_node(f"{prefix}_gamma", gamma_np, k_w, i_w, f_w, initializers)
+        nodes.extend(g_nodes)
+        if has_bias:
+            k_b, i_b, f_b = module.bias_quantizer.get_quantization_bits()
+            b_nodes, q_beta = _int_weight_node(f"{prefix}_beta", beta_np, k_b, i_b, f_b, initializers)
+            nodes.extend(b_nodes)
+    else:
+        q_gamma = f"{prefix}_gamma"
+        initializers.append(onh.from_array(gamma_np, name=q_gamma))
+        if has_bias:
+            q_beta = f"{prefix}_beta"
+            initializers.append(onh.from_array(beta_np, name=q_beta))
+
+    ln_inputs = [current, q_gamma]
+    if has_bias:
+        ln_inputs.append(q_beta)
+    ln_out = f"{prefix}_ln"
+    nodes.append(
+        oh.make_node(
+            "LayerNormalization",
+            inputs=ln_inputs,
+            outputs=[ln_out],
+            axis=axis,
+            epsilon=float(module.eps),
+        )
+    )
+    current = ln_out
+    current = _maybe_quant_output(module, prefix, current, nodes, initializers, quant_fn)
+    return current
+
+
 def _add_avgpool(module, prefix, current, nodes, initializers, ndim, quant_fn):
     current = _maybe_quant_input(module, prefix, current, nodes, initializers, quant_fn)
 
@@ -967,6 +1063,8 @@ def _emit_module(
         )
     if isinstance(module, (PQBatchNorm2d, PQBatchNorm1d)):
         return _add_batchnorm(module, prefix, current, nodes, initializers, quant_fn, use_qonnx, store_integer_weights)
+    if isinstance(module, PQLayerNorm):
+        return _add_layernorm(module, prefix, current, nodes, initializers, quant_fn, use_qonnx, store_integer_weights)
     if isinstance(module, PQAvgPool2d):
         return _add_avgpool(module, prefix, current, nodes, initializers, ndim=2, quant_fn=quant_fn)
     if isinstance(module, PQAvgPool1d):
@@ -1066,6 +1164,57 @@ def _emit_module(
                     "LeakyRelu", inputs=[current], outputs=[act_out], alpha=module.activation_function.negative_slope
                 )
             )
+        elif act == "gelu":
+            # Decompose so the default opset (13) works; ONNX added a Gelu op only in opset 20.
+            approximate = getattr(module.activation_function, "approximate", "none")
+            half_name = f"{prefix}_gelu_half"
+            one_name = f"{prefix}_gelu_one"
+            initializers += [
+                onh.from_array(np.array(0.5, dtype=np.float32), name=half_name),
+                onh.from_array(np.array(1.0, dtype=np.float32), name=one_name),
+            ]
+            if approximate == "tanh":
+                # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                c0_name = f"{prefix}_gelu_sqrt2_over_pi"
+                c1_name = f"{prefix}_gelu_c1"
+                three_name = f"{prefix}_gelu_three"
+                initializers += [
+                    onh.from_array(np.array(np.sqrt(2.0 / np.pi), dtype=np.float32), name=c0_name),
+                    onh.from_array(np.array(0.044715, dtype=np.float32), name=c1_name),
+                    onh.from_array(np.array(3.0, dtype=np.float32), name=three_name),
+                ]
+                x3 = f"{prefix}_gelu_x3"
+                cx3 = f"{prefix}_gelu_cx3"
+                inner = f"{prefix}_gelu_inner"
+                scaled = f"{prefix}_gelu_scaled"
+                tanh_out = f"{prefix}_gelu_tanh"
+                plus_one = f"{prefix}_gelu_plus1"
+                x_times = f"{prefix}_gelu_xprod"
+                nodes += [
+                    oh.make_node("Pow", inputs=[current, three_name], outputs=[x3]),
+                    oh.make_node("Mul", inputs=[x3, c1_name], outputs=[cx3]),
+                    oh.make_node("Add", inputs=[current, cx3], outputs=[inner]),
+                    oh.make_node("Mul", inputs=[inner, c0_name], outputs=[scaled]),
+                    oh.make_node("Tanh", inputs=[scaled], outputs=[tanh_out]),
+                    oh.make_node("Add", inputs=[tanh_out, one_name], outputs=[plus_one]),
+                    oh.make_node("Mul", inputs=[current, plus_one], outputs=[x_times]),
+                    oh.make_node("Mul", inputs=[x_times, half_name], outputs=[act_out]),
+                ]
+            else:
+                # Exact: 0.5 * x * (1 + erf(x / sqrt(2)))
+                inv_sqrt2_name = f"{prefix}_gelu_inv_sqrt2"
+                initializers.append(onh.from_array(np.array(1.0 / np.sqrt(2.0), dtype=np.float32), name=inv_sqrt2_name))
+                scaled = f"{prefix}_gelu_scaled"
+                erf_out = f"{prefix}_gelu_erf"
+                plus_one = f"{prefix}_gelu_plus1"
+                x_times = f"{prefix}_gelu_xprod"
+                nodes += [
+                    oh.make_node("Mul", inputs=[current, inv_sqrt2_name], outputs=[scaled]),
+                    oh.make_node("Erf", inputs=[scaled], outputs=[erf_out]),
+                    oh.make_node("Add", inputs=[erf_out, one_name], outputs=[plus_one]),
+                    oh.make_node("Mul", inputs=[current, plus_one], outputs=[x_times]),
+                    oh.make_node("Mul", inputs=[x_times, half_name], outputs=[act_out]),
+                ]
         else:
             raise TypeError(f"PQActivation: unsupported activation {act!r} for ONNX export")
         current = act_out
@@ -1171,6 +1320,177 @@ def convert_to_onnx(
 
 
 # ---------------------------------------------------------------------------
+# Hardware-targeted static-QDQ LayerNormalization graph
+# ---------------------------------------------------------------------------
+
+
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def export_qdq_layernorm(
+    output_path: str,
+    input_shape,
+    gamma: np.ndarray,
+    beta: np.ndarray,
+    input_scale_log2: int,
+    output_scale_log2: int,
+    eps_q0: int = 1,
+    opset: int = 17,
+) -> onnx.ModelProto:
+    """Build and save a single-LayerNormalization ONNX graph using static QDQ quantization.
+
+    Graph layout::
+
+        int8 input -> DequantizeLinear -> LayerNormalization -> QuantizeLinear -> DequantizeLinear -> output
+
+    All quantization parameters are explicit float32 initializers (no dynamic
+    tensors).  Per-tensor quantization only; activation zero-points are 0.
+
+    Constraints (validated at build time, not in the graph):
+      * ``input_shape`` is rank-2 or rank-3 with no dynamic dims.
+      * Last dim ``D`` is a power of two AND a multiple of 32.
+      * ``gamma``/``beta`` are 1-D float arrays of length ``D``.
+      * ``gamma`` is exactly representable as int16 with scale ``2**-7``  (Q7).
+      * ``beta``  is exactly representable as int16 with scale ``2**-15`` (Q15).
+      * Input/output scales are exact powers of two, given as log2 exponents.
+      * ``epsilon = eps_q0 * input_scale**2`` with integer ``eps_q0 >= 1``.
+      * Normalization axis is the last axis.
+
+    Args:
+        output_path:        Where to save the .onnx file.
+        input_shape:        Static shape of the int8 graph input, e.g. ``(4, 64)`` or ``(1, 4, 64)``.
+        gamma:              Constant gamma initializer, shape ``(D,)``.
+        beta:               Constant beta initializer, shape ``(D,)``.
+        input_scale_log2:   Integer ``a`` with input scale ``= 2**a``.
+        output_scale_log2:  Integer ``b`` with output scale ``= 2**b``.
+        eps_q0:             Positive integer ``>= 1``; ``epsilon = eps_q0 * (2**a)**2``.
+        opset:              ONNX opset version (must be ``>= 17`` for LayerNormalization).
+
+    Returns:
+        The constructed ``onnx.ModelProto``.
+    """
+    # ----- validate shape -----
+    input_shape = tuple(int(d) for d in input_shape)
+    if len(input_shape) not in (2, 3):
+        raise ValueError(f"input_shape rank must be 2 or 3, got {len(input_shape)} ({input_shape})")
+    for d in input_shape:
+        if d <= 0:
+            raise ValueError(f"input_shape must be fully static and positive, got {input_shape}")
+    D = input_shape[-1]
+    if not _is_pow2(D):
+        raise ValueError(f"last dim must be a power of two, got {D}")
+    if D % 32 != 0:
+        raise ValueError(f"last dim must be a multiple of 32, got {D}")
+
+    # ----- validate gamma / beta -----
+    gamma = np.asarray(gamma, dtype=np.float32)
+    beta = np.asarray(beta, dtype=np.float32)
+    if gamma.shape != (D,):
+        raise ValueError(f"gamma must have shape ({D},), got {gamma.shape}")
+    if beta.shape != (D,):
+        raise ValueError(f"beta must have shape ({D},), got {beta.shape}")
+
+    GAMMA_F = 7  # Q7  in int16 -> scale = 2**-7
+    BETA_F = 15  # Q15 in int16 -> scale = 2**-15
+    INT16_MIN, INT16_MAX = -(2**15), 2**15 - 1
+
+    def _check_q_int16(arr: np.ndarray, frac_bits: int, name: str) -> None:
+        scaled = arr.astype(np.float64) * (2**frac_bits)
+        rounded = np.round(scaled)
+        # Exactly representable: rounding is a no-op (within fp slack).
+        if not np.allclose(scaled, rounded, atol=1e-4):
+            raise ValueError(
+                f"{name} not exactly representable as int16 Q{frac_bits} "
+                f"(max abs round error = {np.max(np.abs(scaled - rounded)):.6g})"
+            )
+        if rounded.min() < INT16_MIN or rounded.max() > INT16_MAX:
+            raise ValueError(f"{name} overflows int16 at Q{frac_bits} " f"(range [{rounded.min()}, {rounded.max()}])")
+
+    _check_q_int16(gamma, GAMMA_F, "gamma")
+    _check_q_int16(beta, BETA_F, "beta")
+
+    # ----- validate quant params -----
+    input_scale_log2 = int(input_scale_log2)
+    output_scale_log2 = int(output_scale_log2)
+    eps_q0 = int(eps_q0)
+    if eps_q0 < 1:
+        raise ValueError(f"eps_q0 must be >= 1, got {eps_q0}")
+
+    if opset < 17:
+        raise ValueError(f"opset must be >= 17 for LayerNormalization, got {opset}")
+
+    input_scale = float(2.0**input_scale_log2)
+    output_scale = float(2.0**output_scale_log2)
+    epsilon = float(eps_q0) * input_scale * input_scale
+
+    # ----- build initializers -----
+    initializers = [
+        onh.from_array(np.array(input_scale, dtype=np.float32), name="input_scale"),
+        onh.from_array(np.array(0, dtype=np.int8), name="input_zero_point"),
+        onh.from_array(np.array(output_scale, dtype=np.float32), name="output_scale"),
+        onh.from_array(np.array(0, dtype=np.int8), name="output_zero_point"),
+        onh.from_array(gamma.astype(np.float32), name="gamma"),
+        onh.from_array(beta.astype(np.float32), name="beta"),
+    ]
+
+    # ----- build nodes -----
+    nodes = [
+        oh.make_node(
+            "DequantizeLinear",
+            inputs=["input_q", "input_scale", "input_zero_point"],
+            outputs=["x_dq"],
+            name="input_dq",
+        ),
+        oh.make_node(
+            "LayerNormalization",
+            inputs=["x_dq", "gamma", "beta"],
+            outputs=["ln_out"],
+            name="layernorm",
+            axis=-1,
+            epsilon=epsilon,
+        ),
+        oh.make_node(
+            "QuantizeLinear",
+            inputs=["ln_out", "output_scale", "output_zero_point"],
+            outputs=["y_q"],
+            name="output_q",
+        ),
+        oh.make_node(
+            "DequantizeLinear",
+            inputs=["y_q", "output_scale", "output_zero_point"],
+            outputs=["output"],
+            name="output_dq",
+        ),
+    ]
+
+    # ----- build graph + model -----
+    input_vi = oh.make_tensor_value_info("input_q", TensorProto.INT8, list(input_shape))
+    output_vi = oh.make_tensor_value_info("output", TensorProto.FLOAT, list(input_shape))
+
+    graph = oh.make_graph(
+        nodes=nodes,
+        name="qdq_layernorm",
+        inputs=[input_vi],
+        outputs=[output_vi],
+        initializer=initializers,
+    )
+
+    model_proto = oh.make_model(graph, opset_imports=[oh.make_opsetid("", opset)])
+    model_proto.ir_version = 8
+
+    # Strip any initializer names that the onnx library may have added to graph.input.
+    _init_names = {t.name for t in model_proto.graph.initializer}
+    _data_inputs = [vi for vi in model_proto.graph.input if vi.name not in _init_names]
+    del model_proto.graph.input[:]
+    model_proto.graph.input.extend(_data_inputs)
+
+    onnx.checker.check_model(model_proto)
+    onnx.save(model_proto, output_path)
+    return model_proto
+
+
+# ---------------------------------------------------------------------------
 # FX-based conversion (supports arbitrary nn.Module topology / skip connections)
 # ---------------------------------------------------------------------------
 
@@ -1184,6 +1504,7 @@ class _PQTracer(_fx.Tracer):
         PQConv1d,
         PQBatchNorm1d,
         PQBatchNorm2d,
+        PQLayerNorm,
         PQAvgPool1d,
         PQAvgPool2d,
         PQMultiheadAttention,
@@ -1218,6 +1539,13 @@ def convert_to_onnx_fx(
     graph = _PQTracer().trace(model)
     gm = _fx.GraphModule(model, graph)
 
+    # ShapeProp populates node.meta["tensor_meta"], which transpose/permute
+    # need to expand torch's two-arg .transpose(d0, d1) into a full ONNX perm.
+    from torch.fx.passes.shape_prop import ShapeProp
+
+    with torch.no_grad():
+        ShapeProp(gm).propagate(torch.zeros(1, *input_shape))
+
     onnx_nodes: list[onnx.NodeProto] = []
     initializers: list[onnx.TensorProto] = []
     node_to_name: dict[_fx.Node, str] = {}
@@ -1227,6 +1555,41 @@ def convert_to_onnx_fx(
         if isinstance(arg, _fx.Node):
             return node_to_name[arg]
         raise TypeError(f"Expected fx.Node, got {type(arg)}")
+
+    def _binop_inputs(node: _fx.Node) -> list[str]:
+        # Like _res for both args, but lifts scalar literals (int/float/bool)
+        # to float32 initializers so patterns like ``x / 2.0`` work.
+        names: list[str] = []
+        for i, a in enumerate(node.args[:2]):
+            if isinstance(a, _fx.Node):
+                names.append(node_to_name[a])
+            elif isinstance(a, (int, float, bool)):
+                cname = f"{node.name}_arg{i}_const"
+                initializers.append(onh.from_array(np.array(float(a), dtype=np.float32), name=cname))
+                names.append(cname)
+            else:
+                raise TypeError(f"FX export: unsupported binary-op arg type {type(a).__name__}")
+        return names
+
+    def _rank(n: _fx.Node) -> int:
+        meta = n.meta.get("tensor_meta")
+        if meta is None or not hasattr(meta, "shape"):
+            raise RuntimeError(f"FX export: ShapeProp did not produce tensor_meta for {n.name!r}")
+        return len(meta.shape)
+
+    def _swap_perm(rank: int, d0: int, d1: int) -> list[int]:
+        perm = list(range(rank))
+        a, b = d0 % rank, d1 % rank
+        perm[a], perm[b] = perm[b], perm[a]
+        return perm
+
+    def _resolve_perm_dims(args, rank: int) -> list[int]:
+        # Accept both permute(d0, d1, ...) and permute([d0, d1, ...]) shapes.
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            dims = args[0]
+        else:
+            dims = args
+        return [int(d) % rank for d in dims]
 
     for node in gm.graph.nodes:
         if node.op == "placeholder":
@@ -1294,12 +1657,42 @@ def convert_to_onnx_fx(
 
             if fn in (torch.add, _operator.add, _operator.iadd):
                 out = f"{node.name}_add"
-                onnx_nodes.append(oh.make_node("Add", inputs=[_res(node.args[0]), _res(node.args[1])], outputs=[out]))
+                onnx_nodes.append(oh.make_node("Add", inputs=_binop_inputs(node), outputs=[out]))
                 node_to_name[node] = out
 
             elif fn in (torch.mul, _operator.mul):
                 out = f"{node.name}_mul"
-                onnx_nodes.append(oh.make_node("Mul", inputs=[_res(node.args[0]), _res(node.args[1])], outputs=[out]))
+                onnx_nodes.append(oh.make_node("Mul", inputs=_binop_inputs(node), outputs=[out]))
+                node_to_name[node] = out
+
+            elif fn in (torch.sub, _operator.sub, _operator.isub):
+                out = f"{node.name}_sub"
+                onnx_nodes.append(oh.make_node("Sub", inputs=_binop_inputs(node), outputs=[out]))
+                node_to_name[node] = out
+
+            elif fn in (torch.div, _operator.truediv, _operator.itruediv):
+                out = f"{node.name}_div"
+                onnx_nodes.append(oh.make_node("Div", inputs=_binop_inputs(node), outputs=[out]))
+                node_to_name[node] = out
+
+            elif fn in (torch.matmul, _operator.matmul):
+                out = f"{node.name}_matmul"
+                onnx_nodes.append(oh.make_node("MatMul", inputs=_binop_inputs(node), outputs=[out]))
+                node_to_name[node] = out
+
+            elif fn is torch.transpose:
+                # torch.transpose(t, d0, d1) swaps two dims; ONNX needs a full perm.
+                rank = _rank(node.args[0])
+                perm = _swap_perm(rank, int(node.args[1]), int(node.args[2]))
+                out = f"{node.name}_transpose"
+                onnx_nodes.append(oh.make_node("Transpose", inputs=[_res(node.args[0])], outputs=[out], perm=perm))
+                node_to_name[node] = out
+
+            elif fn is torch.permute:
+                rank = _rank(node.args[0])
+                perm = _resolve_perm_dims(node.args[1:], rank)
+                out = f"{node.name}_permute"
+                onnx_nodes.append(oh.make_node("Transpose", inputs=[_res(node.args[0])], outputs=[out], perm=perm))
                 node_to_name[node] = out
 
             elif fn is torch.cat:
@@ -1347,6 +1740,25 @@ def convert_to_onnx_fx(
                 out = f"{node.name}_reshape"
                 initializers.append(onh.from_array(np.array(shape_vals, dtype=np.int64), name=shape_name))
                 onnx_nodes.append(oh.make_node("Reshape", inputs=[x, shape_name], outputs=[out]))
+                node_to_name[node] = out
+
+            elif node.target == "transpose":
+                rank = _rank(node.args[0])
+                perm = _swap_perm(rank, int(node.args[1]), int(node.args[2]))
+                out = f"{node.name}_transpose"
+                onnx_nodes.append(oh.make_node("Transpose", inputs=[x], outputs=[out], perm=perm))
+                node_to_name[node] = out
+
+            elif node.target == "permute":
+                rank = _rank(node.args[0])
+                perm = _resolve_perm_dims(node.args[1:], rank)
+                out = f"{node.name}_permute"
+                onnx_nodes.append(oh.make_node("Transpose", inputs=[x], outputs=[out], perm=perm))
+                node_to_name[node] = out
+
+            elif node.target == "matmul":
+                out = f"{node.name}_matmul"
+                onnx_nodes.append(oh.make_node("MatMul", inputs=[x, _res(node.args[1])], outputs=[out]))
                 node_to_name[node] = out
 
             else:
