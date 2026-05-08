@@ -449,7 +449,7 @@ class ModelDistiller:
         self.loss_fn = loss_fn
         self.T = temperature
         self.alpha = alpha
-        self.precompute_teacher_outputs = precompute_teacher_outputs
+        self._precompute_teacher_outputs = precompute_teacher_outputs
         self.prefetch_workers = prefetch_workers
         self.cache_dir = cache_dir
         self.device = device
@@ -618,7 +618,7 @@ class ModelDistiller:
         global_epoch = 0
 
         try:
-            if self.precompute_teacher_outputs:
+            if self._precompute_teacher_outputs:
                 tmpdir = tempfile.TemporaryDirectory(prefix="mdistil_", dir=self.cache_dir or os.getcwd())
                 dataloader = self.precompute_teacher_outputs(dataloader, tmpdir.name)
                 if val_dataloader is not None:
