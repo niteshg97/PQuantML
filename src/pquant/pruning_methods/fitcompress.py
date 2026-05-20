@@ -14,9 +14,10 @@ class FITCompress(keras.layers.Layer):
         self.is_finetuning = False
 
     def build(self, input_shape):
-        self.mask = self.add_weight(shape=input_shape, initializer="ones", trainable=False)
+        self.mask = self.add_weight(name="compression_mask",shape=input_shape,initializer="ones",trainable=False)
         super().build(input_shape)
 
+    @tf.function(reduce_retracing=True)
     def call(self, weight):
         return self.mask * weight
 
