@@ -26,7 +26,7 @@ class FITCompress(keras.layers.Layer):
     def pre_epoch_function(self, epoch, total_epochs):
         pass
 
-    def calculate_additional_loss(*args, **kwargs):
+    def calculate_additional_loss(self):
         return 0
 
     def pre_finetune_function(self):
