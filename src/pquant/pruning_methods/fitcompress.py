@@ -17,7 +17,6 @@ class FITCompress(keras.layers.Layer):
         self.mask = self.add_weight(name="compression_mask",shape=input_shape,initializer="ones",trainable=False)
         super().build(input_shape)
 
-    @tf.function(reduce_retracing=True)
     def call(self, weight):
         return self.mask * weight
 
@@ -27,7 +26,7 @@ class FITCompress(keras.layers.Layer):
     def pre_epoch_function(self, epoch, total_epochs):
         pass
 
-    def calculate_additional_loss(*args, **kwargs):
+    def calculate_additional_loss(self):
         return 0
 
     def pre_finetune_function(self):
